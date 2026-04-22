@@ -1,6 +1,5 @@
 import re
-from typing import List, Tuple, Optional
-
+from typing import List
 import pandas as pd
 import streamlit as st
 
@@ -10,27 +9,11 @@ import streamlit as st
 CSV_FILE = "products.csv"
 BUSINESS_PHONE = "+220 4033340"
 
-# Expected CSV columns:
-# - Product Name
-# - Keywords
-# - Units
-# - Price
-#
-# Stock status can come from one of these columns if present:
-# - In Stock
-# - Availability
-# - Stock Status
-# - Status
-#
-# Optional extra columns are fine.
-
-
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
 
 def normalize_text(text: str) -> str:
-    """Lowercase and remove extra punctuation/spaces for easier matching."""
     if pd.isna(text):
         return ""
     text = str(text).lower().strip()
@@ -40,33 +23,20 @@ def normalize_text(text: str) -> str:
 
 
 def parse_keywords(row: pd.Series) -> List[str]:
-    """Build a list of searchable terms from Product Name + Keywords."""
     product_name = normalize_text(row.get("Product Name", ""))
     raw_keywords = str(row.get("Keywords", "") or "")
 
-    keywords = [normalize_text(product_name)] if product_name else []
+    keywords = [product_name] if product_name else []
+
     for keyword in raw_keywords.split(","):
         cleaned = normalize_text(keyword)
         if cleaned:
             keywords.append(cleaned)
 
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_keywords = []
-    for keyword in keywords:
-        if keyword not in seen:
-            seen.add(keyword)
-            unique_keywords.append(keyword)
-    return unique_keywords
+    return list(dict.fromkeys(keywords))
 
 
 def score_match(query: str, keywords: List[str]) -> int:
-    """
-    Simple scoring:
-    - exact keyword match gets highest score
-    - substring matches score based on keyword length
-    - token overlap gives partial score
-    """
     if not query or not keywords:
         return 0
 
@@ -90,36 +60,14 @@ def score_match(query: str, keywords: List[str]) -> int:
     return best_score
 
 
-def normalize_stock_value(value) -> bool:
-    """Convert common stock formats into True/False."""
-    text = normalize_text(value)
-    if text in {"yes", "y", "true", "1", "in stock", "available", "available in stock", "instock", "availability yes"}:
-        return True
-    if text in {"no", "n", "false", "0", "out of stock", "unavailable", "sold out"}:
-        return False
-
+def is_in_stock(units_value) -> bool:
     try:
-        return float(value) > 0
-    except Exception:
-        return False
-
-
-def detect_stock_column(df: pd.DataFrame) -> Optional[str]:
-    """Prefer an explicit stock-status column over deriving from units."""
-    stock_column_candidates = ["In Stock", "Availability", "Stock Status", "Status"]
-    for col in stock_column_candidates:
-        if col in df.columns:
-            return col
-    return None
-
-    try:
-        return float(value) > 0
+        return float(units_value) > 0
     except Exception:
         return False
 
 
 def format_price(value) -> str:
-    """Format price consistently for display."""
     try:
         number = float(str(value).replace(",", ""))
         if number.is_integer():
@@ -129,7 +77,9 @@ def format_price(value) -> str:
         return str(value)
 
 
-@st.cache_data
+# ------------------------------------------------------------
+# Load data
+# ------------------------------------------------------------
 
 def load_products(csv_file: str) -> pd.DataFrame:
     df = pd.read_csv(csv_file)
@@ -137,117 +87,91 @@ def load_products(csv_file: str) -> pd.DataFrame:
     required_columns = {"Product Name", "Keywords", "Units", "Price"}
     missing_columns = required_columns.difference(df.columns)
     if missing_columns:
-        raise ValueError(
-            f"Missing required columns: {', '.join(sorted(missing_columns))}"
-        )
-
-    stock_column = detect_stock_column(df)
-    if stock_column is None:
-        raise ValueError(
-            "Missing stock column. Add one of these columns: In Stock, Availability, Stock Status, Status"
-        )
+        raise ValueError(f"Missing columns: {missing_columns}")
 
     df = df.copy()
-    df["_stock_source_column"] = stock_column
     df["_keywords_list"] = df.apply(parse_keywords, axis=1)
-    df["_stock_bool"] = df[stock_column].apply(normalize_stock_value)
-    df["_product_name_norm"] = df["Product Name"].apply(normalize_text)
+    df["_stock_bool"] = df["Units"].apply(is_in_stock)
     return df
 
 
 def find_matching_rows(query: str, df: pd.DataFrame, min_score: int = 10) -> pd.DataFrame:
     query_norm = normalize_text(query)
-    if not query_norm:
-        return df.iloc[0:0].copy()
 
-    scored_rows = []
+    results = []
 
     for _, row in df.iterrows():
         score = score_match(query_norm, row["_keywords_list"])
         if score >= min_score:
-            row_dict = row.to_dict()
-            row_dict["_match_score"] = score
-            scored_rows.append(row_dict)
+            r = row.to_dict()
+            r["_match_score"] = score
+            results.append(r)
 
-    if not scored_rows:
-        return df.iloc[0:0].copy()
+    if not results:
+        return pd.DataFrame()
 
-    results_df = pd.DataFrame(scored_rows)
-    results_df = results_df.sort_values(
+    df_results = pd.DataFrame(results)
+
+    return df_results.sort_values(
         by=["_match_score", "_stock_bool", "Units"],
         ascending=[False, False, False]
     )
-    return results_df
-
-
-def build_single_response(row: pd.Series) -> str:
-    product_name = row["Product Name"]
-    price = format_price(row["Price"])
-    in_stock = row["_stock_bool"]
-
-    if in_stock:
-        return f"{product_name} is available. Price: {price} dalasis."
-    return f"{product_name} is currently out of stock. Please call {BUSINESS_PHONE}."
-
-
-def build_multiple_response(matches_df: pd.DataFrame) -> List[str]:
-    responses = []
-    for _, row in matches_df.iterrows():
-        status = "In stock" if row["_stock_bool"] else "Out of stock"
-        price = format_price(row["Price"])
-        responses.append(
-            f"- {row['Product Name']} — {status} — {price} dalasis"
-        )
-    return responses
 
 
 # ------------------------------------------------------------
-# App
+# App UI
 # ------------------------------------------------------------
 
-st.set_page_config(page_title="Product Lookup Prototype", page_icon="🛒")
-st.image(r"C:\\Users\\htrab\\Malak_Chat Bot_Project\\Logo.jpeg", width=200)
+st.set_page_config(page_title="Product Lookup", page_icon="🛒")
+
+# Logo (must be in same folder as this file)
+st.image("Logo.jpeg", width=200)
+
 st.title("Check Product Availability & Prices")
-st.caption("Search for a product to see availability and price")
 
 st.markdown(
     """
-    Type the product name below.
-    If we find a match, we will show availability and price.
-    If not, please call +220 4033340.
+    Find out if a product is available and see the price instantly.
+
+    Type the product name below (e.g. aferin, abidec, accu chek).
     """
 )
 
+# ------------------------------------------------------------
+# Main logic
+# ------------------------------------------------------------
+
 try:
     products_df = load_products(CSV_FILE)
-except FileNotFoundError:
-    st.error(
-        "products.csv was not found. Export your Google Sheet as CSV and save it in the same folder as this script."
-    )
-    st.stop()
-except Exception as exc:
-    st.error(f"Error loading file: {exc}")
+except Exception as e:
+    st.error(str(e))
     st.stop()
 
-query = st.text_input(
-    "Customer query",
-    placeholder="e.g. aferin, abidec, accu chek strips",
-)
+query = st.text_input("Search for a product")
 
 if query:
-    matches_df = find_matching_rows(query, products_df)
+    matches = find_matching_rows(query, products_df)
 
-    if not matches_df.empty:
-        if len(matches_df) == 1:
-            best_match = matches_df.iloc[0]
-            st.write(build_single_response(best_match))
+    if not matches.empty:
+
+        if len(matches) == 1:
+            row = matches.iloc[0]
+
+            if row["_stock_bool"]:
+                st.success(f"✅ {row['Product Name']} is available")
+                st.write(f"Price: {format_price(row['Price'])} dalasis")
+            else:
+                st.error(f"❌ {row['Product Name']} is out of stock")
+                st.write(f"Please call {BUSINESS_PHONE}")
+
         else:
             st.write("We found these matching products:")
-            for response_line in build_multiple_response(matches_df):
-                st.write(response_line)
+
+            for _, row in matches.iterrows():
+                if row["_stock_bool"]:
+                    st.success(f"{row['Product Name']} — {format_price(row['Price'])} dalasis")
+                else:
+                    st.warning(f"{row['Product Name']} — Out of stock")
+
     else:
         st.warning(f"Sorry, we could not find that product. Please call {BUSINESS_PHONE}.")
-
-st.divider()
-
-
